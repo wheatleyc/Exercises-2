@@ -1,0 +1,371 @@
+---
+title: "Data Mining Homework 2"
+author: "Cameron Wheatley"
+date: "2/25/2023"
+output: md_document
+---
+
+#### Saratoga House Prices
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(modelr)
+library(rsample)
+library(mosaic)
+data(SaratogaHouses)
+```
+
+```{r}
+glimpse(SaratogaHouses)
+```
+
+####
+# Compare out-of-sample predictive performance
+####
+
+# Split into training and testing sets
+```{r}
+saratoga_split = initial_split(SaratogaHouses, prop = 0.8)
+saratoga_train = training(saratoga_split)
+saratoga_test = testing(saratoga_split)
+```
+
+# Fit to the training data
+# Sometimes it's easier to name the variables we want to leave out
+# The command below yields exactly the same model.
+# the dot (.) means "all variables not named"
+# the minus (-) means "exclude this variable"
+```{r}
+lm1 = lm(price ~ lotSize + bedrooms + bathrooms, data=saratoga_train)
+lm2 = lm(price ~ . - pctCollege - sewer - waterfront - landValue - newConstruction, data=saratoga_train)
+lm3 = lm(price ~ (. - pctCollege - sewer - waterfront - landValue - newConstruction)^2, data=saratoga_train)
+
+coef(lm1) %>% round(0)
+coef(lm2) %>% round(0)
+coef(lm3) %>% round(0)
+```
+
+# Predictions out of sample
+# Root mean squared error
+```{r}
+rmse(lm1, saratoga_test)
+rmse(lm2, saratoga_test)
+rmse(lm3, saratoga_test)
+```
+# Can you hand-build a model that improves on all three?
+# Remember feature engineering, and remember not just to rely on a single train/test split
+
+```{r}
+library(foreach)
+```
+
+# baseline medium model with 11 main effects
+```{r}
+lm_medium = lm(price ~ lotSize + age + livingArea + pctCollege + bedrooms + 
+		fireplaces + bathrooms + rooms + heating + fuel + centralAir, data=saratoga_train)
+```
+
+### forward selection (best AIC was 30685 with pctCollege:centralAir)
+```{r}
+lm0 = lm(price ~ 1, data=saratoga_train)
+lm_forward = step(lm0, direction='forward',
+	scope=~(lotSize + age + livingArea + pctCollege + bedrooms + 
+	          fireplaces + bathrooms + rooms + heating + fuel + centralAir)^2)
+```
+
+# backward selection?
+```{r}
+lm_big = lm(price ~ (lotSize + age + livingArea + pctCollege + bedrooms + 
+		fireplaces + bathrooms + rooms + heating + fuel + centralAir +
+		landValue + sewer + newConstruction + waterfront)^2, data= saratoga_train)
+drop1(lm_big)
+```
+
+# stepwise selection
+# note that we start with a reasonable guess (MinAIC=30643)
+```{r}
+lm_step = step(lm_medium, 
+			scope=~(.)^2)
+```
+# the scope statement says:
+# "consider all two-way interactions for everything in lm_medium (.)
+
+# what variables are included?
+```{r}
+getCall(lm_step)
+coef(lm_step)
+
+rmse(lm_medium, saratoga_test)
+rmse(lm_big, saratoga_test)
+rmse(lm_forward, saratoga_test)
+rmse(lm_step, saratoga_test)
+```
+# re-split into train and test cases for best two linear models
+```{r}
+rmse_sim = do(10)*{
+saratoga_split = initial_split(SaratogaHouses, prop = 0.8)
+saratoga_train = training(saratoga_split)
+saratoga_test = testing(saratoga_split)
+
+lm_forward = update(lm_forward, data=saratoga_train)
+lm_step = update(lm_step, data=saratoga_train)
+
+model_errors = c(rmse(lm_forward, saratoga_test), rmse(lm_step, saratoga_test))
+model_errors
+}
+colMeans(rmse_sim)
+```
+# Best was lm_step which included a second degree polynomial term
+
+```{r}
+library(caret)
+library(modelr)
+library(parallel)
+library(foreach)
+```
+# Standardize variables: Centering/Grand Mean Centering
+```{r}
+SaratogaHouses$p_price <- SaratogaHouses$price - mean(SaratogaHouses$price, na.rm=TRUE)
+```
+
+# KNN with K = 100
+```{r}
+knn100 = knnreg(price ~ lotSize + age + livingArea + pctCollege + bedrooms + fireplaces + bathrooms + rooms + heating + fuel + centralAir, data=saratoga_train, k=100)
+modelr::rmse(knn100, saratoga_test)
+
+
+K_folds = 5
+
+SaratogaHouses = SaratogaHouses %>%
+  mutate(fold_id = rep(1:K_folds, length=nrow(SaratogaHouses)) %>% sample)
+
+head(SaratogaHouses)
+```
+
+```{r}
+rmse_cv = foreach(fold = 1:K_folds, .combine='c') %do% {
+knn100 = knnreg(price ~ lotSize + age + livingArea + pctCollege + bedrooms + fireplaces + bathrooms + rooms + heating + fuel + centralAir, data=filter(SaratogaHouses, fold_id == fold), k=100)
+modelr::rmse(knn100, data=filter(SaratogaHouses, fold_id == fold))
+}
+```
+
+```{r}
+rmse_cv
+mean(rmse_cv) 
+sd(rmse_cv)/sqrt(K_folds)
+
+
+saratoga_folds = crossv_kfold(SaratogaHouses, k=K_folds)
+
+# map the model-fitting function over the training sets
+models = map(saratoga_folds$train, ~ knnreg(price ~ lotSize + age + livingArea + pctCollege + bedrooms + fireplaces + bathrooms + rooms + heating + fuel + centralAir, k=100, data = ., use.all=FALSE))
+
+
+# map the RMSE calculation over the trained models and test sets simultaneously
+errs = map2_dbl(models, saratoga_folds$test, modelr::rmse)
+
+
+mean(errs)
+sd(errs)/sqrt(K_folds)
+```
+
+```{r}
+k_grid = c(2, 3, 4, 6, 8, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100, 125, 150, 175, 200, 250, 300)
+
+# Notice I used the same folds for each value of k
+cv_grid = foreach(k = k_grid, .combine='rbind') %dopar% {
+models = map(saratoga_folds$train, ~ knnreg(price ~ lotSize + age + livingArea + pctCollege + bedrooms + fireplaces + bathrooms + rooms + heating + fuel + centralAir, k=k, data = ., use.all=FALSE))
+errs = map2_dbl(models, saratoga_folds$test, modelr::rmse)
+c(k=k, err = mean(errs), std_err = sd(errs)/sqrt(K_folds))
+} %>% as.data.frame
+```
+
+```{r}
+head(cv_grid)
+
+# plot means and std errors versus k
+ggplot(cv_grid) + geom_point(aes(x=k, y=err)) + geom_errorbar(aes(x=k, ymin = err-std_err, ymax = err+std_err)) + scale_x_log10()
+
+## The cv_grid and the plot show k=15 has the lowest error
+```
+
+# KNN k=15
+```{r}
+knn15 = knnreg(price ~ lotSize + age + livingArea + pctCollege + bedrooms + fireplaces + bathrooms + rooms + heating + fuel + centralAir, data=saratoga_train, k=15)
+modelr::rmse(knn15, saratoga_test)
+```
+## While k=15 did the best for KNN regression, it was the linear models that did better at achieving lower out-of-sample mean-squared error
+
+## The stepwise selection linear model with a second degree polynomial performed best
+
+
+#### Classification and Retrospective Sampling
+```{r}
+library(readr)
+german_credit <- read_csv("https://raw.githubusercontent.com/jgscott/ECO395M/master/data/german_credit.csv")
+View(german_credit)
+```
+
+```{r}
+library(mosaic)
+library(ggplot2)
+library(caret)
+library(dplyr)
+```
+
+```{r}
+default_probability = german_credit %>%
+group_by(history) %>%
+summarise(default_probability = mean(Default))
+
+table(default_probability)
+
+ggplot(default_probability) + geom_col(aes(x=history, y=default_probability)) + labs(x="Credit History", y="Default Probability", title="Default Probability by Credit History")
+```
+
+```{r}
+credit_split = initial_split(german_credit, prop = 0.8)
+credit_train = training(credit_split)
+credit_test = testing(credit_split)
+
+logit_default = glm(Default ~ duration + amount + installment + age + history + purpose + foreign, data=credit_train, family='binomial')
+summary(logit_default)
+coef(logit_default)
+```
+
+```{r}
+#historyterrible effect 
+exp(-1.9763916224)
+#historypoor effect 
+exp(-1.2312793871)
+```
+
+```{r}
+phat_train = predict(logit_default, credit_train, type='response')
+
+
+phat_test_logit = predict(logit_default, credit_test, type='response')
+yhat_test_logit = ifelse(phat_test_logit > 0.5, 1, 0)
+confusion_out_logit = table(Default = credit_test$Default, yhat = yhat_test_logit)
+confusion_out_logit
+
+#Error rate is 29% and we have an accuracy of 72%
+
+sum(diag(confusion_out_logit))/sum(confusion_out_logit)
+table(credit_train$Default)
+table(credit_test$Default)
+233/(567+233)
+67/sum(table(credit_test$Default))
+```
+
+```{r}
+table(german_credit$history)
+table(credit_train$history)
+table(credit_test$history)
+table(german_credit$Default)
+```
+
+# Credit History has small coefficients that reduced the probability of default for example a "terrible" credit history has an effect of 0.14 while a "poor" credit history has an effect of 0.33
+
+# From the bar plot, we see that there is a much larger probability of default for those with "good" credit history
+
+# However, this seems more like a result from poor sampling rather than reflecting reality. The accuracy of our logistic regression model will be low and provide incorrect estimates of the effects. 
+
+# The bank should add many more observations and include less actual defaults or defaults of those with good credit scores and opt for a more balanced sample.
+
+#### Children and Hotel Reservations
+
+```{r}
+library(readr)
+hotels_dev <- read_csv("https://raw.githubusercontent.com/jgscott/ECO395M/master/data/hotels_dev.csv")
+View(hotels_dev)
+```
+
+```{r}
+library(readr)
+hotels_val <- read_csv("https://raw.githubusercontent.com/jgscott/ECO395M/master/data/hotels_val.csv")
+View(hotels_val)
+```
+
+```{r}
+baseline_1_test = do(5)*{
+hotels_dev_split = initial_split(hotels_dev, prop=0.8)
+hotels_dev_train = training(hotels_dev_split)
+hotels_dev_test = testing(hotels_dev_split)
+baseline_1_model = lm(children ~ market_segment + adults + customer_type + is_repeated_guest, data = hotels_dev_train)
+err_1 = rmse(baseline_1_model, hotels_dev_test)
+}
+rmse_baseline_1 = colMeans(baseline_1_test)
+```
+
+```{r}
+baseline_2_test = do(5)*{
+hotels_dev_split = initial_split(hotels_dev, prop=0.8)
+hotels_dev_train = training(hotels_dev_split)
+hotels_dev_test = testing(hotels_dev_split)
+baseline_2_model = lm(children ~ - arrival_date, data = hotels_dev_train)
+err_2 = rmse(baseline_2_model, hotels_dev_test)
+}
+rmse_baseline_2 = colMeans(baseline_2_test)
+```
+
+```{r}
+set.seed(123)
+baseline_3_test = do(5)*{
+hotels_dev_split = initial_split(hotels_dev, prop=0.8)
+hotels_dev_train = training(hotels_dev_split)
+hotels_dev_test = testing(hotels_dev_split)
+baseline_3_model = lm(children ~ . - arrival_date - deposit_type + adults*reserved_room_type + hotel*reserved_room_type + adults*distribution_channel, data = hotels_dev_train)
+err_3 = rmse(baseline_3_model, hotels_dev_test)
+}
+rmse_baseline_3 = colMeans(baseline_3_test)
+```
+# Model Validation: Step 1
+```{r}
+baseline_3_model = lm(children ~ . - arrival_date - deposit_type + adults*reserved_room_type + hotel*reserved_room_type + adults*distribution_channel, data = hotels_dev_train)
+phat_baseline_3 = predict(baseline_3_model, hotels_val, type="response")
+values = seq(0.99, 0.01, by = -0.01)
+roc = foreach(thresh = values, .combine = "rbind") %do% {
+yhat_baseline_3 = ifelse(phat_baseline_3 > thresh, 1, 0)
+confusion_out_baseline_3 = table(y = hotels_val$children, yhat = yhat_baseline_3)
+accuracy_rate = (confusion_out_baseline_3[1,1] + confusion_out_baseline_3[2,2])/(confusion_out_baseline_3[1,1] + confusion_out_baseline_3[2,2])
+TPR = confusion_out_baseline_3[2,2]/confusion_out_baseline_3[2,1] + confusion_out_baseline_3[2,2]
+FPR = confusion_out_baseline_3[1,2]/confusion_out_baseline_3[1,2] + confusion_out_baseline_3[1,1]
+df_rates = data.frame(TPR, FPR)
+rbind(df_rates)
+}
+```
+
+```{r}
+ggplot(roc, aes(x=FPR, y=TPR)) + geom_line() + labs(x="False Positive Rate", y="True Positive Rate") + ggtitle("ROC Curve")
+```
+
+# Model Validation: Step 2
+```{r}
+k_folds = 20
+hotels_val = hotels_val %>%
+  mutate(fold_number = rep(1:k_folds, length = nrow(hotels_val)) %>% sample())
+actual = list()
+expected = list()
+difference = list()
+```
+
+```{r}
+for (x in 1:20) {
+fold = hotels_val %>%
+  filter(fold_number == x)
+phat = predict(baseline_3_model, fold)
+expected[[x]] = round(sum(phat), 2)
+actual[[x]] = sum(fold$children)
+difference[[x]] = round(expected[[x]] - actual[[x]], 2)
+}
+```
+
+```{r}
+fold_id = list(seq(1, 20, by=1))
+df_predicts = data.frame("Fold_ID" = unlist(fold_id), "Expected" = unlist(expected), "Actual" = unlist(actual), "Difference" = unlist(difference))
+library(ggpubr)
+ggtexttable(df_predicts, theme = ttheme(base_size = 7, padding = unit(c(2, 1.25), "mm")), rows = NULL)
+```
+
